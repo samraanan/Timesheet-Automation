@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.log
+# Ignore generated reports
+Report_*.xlsx
+# Ignore source data (optional, but good practice to keep repo clean)
+Timesheet_*.xlsx
+Timesheet_*.csv
+# Excel temp files
+~$*

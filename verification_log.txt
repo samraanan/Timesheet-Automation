@@ -1,0 +1,15 @@
+--- CMD OUTPUT ---
+Loading configuration from: c:\Users\Shmuel\Desktop\Timesheet_Automation\Config.xlsx
+Loaded Distances from Config.xlsx
+Using file paths from command line arguments...
+Using Distances from Config.
+Processing files...
+Active Projects Found: 8
+Found data for 1 months. Generating reports...
+
+--- Processing Month: 2025-11 ---
+Generating Excel: c:\Users\Shmuel\Desktop\Timesheet_Automation\Report_2025-11_20260102_220026.xlsx ...
+SUCCESS: Report saved successfully to:
+c:\Users\Shmuel\Desktop\Timesheet_Automation\Report_2025-11_20260102_220026.xlsx
+
+--- CMD ERROR ---
