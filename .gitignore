@@ -1,10 +1,65 @@
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs and temporary files
 *.log
-# Ignore generated reports
+*.txt
+Calculation_Log.txt
+Missing_Distances.txt
+verification_log.txt
+report_check*.log
+
+# Backup files
+*_backup_*.xlsx
+*.bak
+
+# Generated reports (keep examples if needed)
 Report_*.xlsx
-# Ignore source data (optional, but good practice to keep repo clean)
-Timesheet_*.xlsx
-Timesheet_*.csv
-# Excel temp files
-~$*
+
+# Test/debug scripts (optional - remove if you want to keep them)
+debug*.py
+test_*.py
+inspect_*.py
+add_*.py
+merge_*.py
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary Excel files
+~$*.xlsx
+~$*.xls

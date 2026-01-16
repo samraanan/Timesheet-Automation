@@ -12,6 +12,20 @@ import warnings
 # התעלמות מאזהרות עיצוב של קבצי מקור ישנים
 warnings.simplefilter("ignore")
 
+# CHECK DEPENDENCIES
+try:
+    import xlsxwriter
+    print("[DEBUG] xlsxwriter is installed.")
+except ImportError:
+    print("CRITICAL ERROR: 'xlsxwriter' library is missing.")
+    print("Please install it by running: pip install xlsxwriter")
+    print("The report generation requires this library for formatting.")
+    # We won't exit immediately, but the write step will fail.
+    # Actually, let's pause to let user see.
+    import time
+    time.sleep(5)
+
+
 # --- GLOBAL CONFIG VARIABLES ---
 CONFIG = {
     'MAPPING': {},
@@ -22,9 +36,13 @@ CONFIG = {
     'ACTIVE_PROJECTS': []
 }
 
+# GLOBAL LIST TO COLLECT MISSING DISTANCES
+MISSING_PAIRS = set()
+CALC_LOG = [] # New debug log
+
 ALLOWED_COLUMNS = [
     'תאריך', 'שעת התחלה', 'שעת סיום', 'פרויקט', 
-    'תיאור', 'הפסקות', 'הערות'
+    'תיאור', 'הפסקות', 'הערות', 'תגיות'
 ]
 
 # Constants
@@ -167,17 +185,40 @@ def load_configuration():
         # 2. Load General Settings
         try:
             df_settings = pd.read_excel(config_path, sheet_name='Settings')
+            
+            # Robust Column Identification
+            # Code expects Key in Col A, Value in Col B, but user might have them swapped.
+            # We trust headers if they exist.
+            
+            settings_cols = [str(c).lower().strip() for c in df_settings.columns]
+            col_key = -1
+            col_val = -1
+            
+            for i, c in enumerate(settings_cols):
+                if 'key' in c: col_key = i
+                elif 'value' in c or 'ערך' in c or 'setting' in c: col_val = i
+            
+            # Fallback defaults if headers are crazy
+            if col_key == -1: col_key = 0
+            if col_val == -1: col_val = 1
+            
+            print(f"[DEBUG] Settings Config: Key Col Index={col_key}, Value Col Index={col_val}")
+
             for _, row in df_settings.iterrows():
-                key = str(row.iloc[0]).strip()
-                val = str(row.iloc[1]).strip()
+                # Safety checks
+                if col_key >= len(row) or col_val >= len(row): continue
+                
+                key = normalize_str(row.iloc[col_key])
+                val = normalize_str(row.iloc[col_val])
                 
                 if key == 'Home_Location':
                     CONFIG['HOME_LOCATION'] = val
+                    print(f"Loaded Home Location: {val}")
                 elif key == 'Ignore_Keywords':
                     keywords = [x.strip() for x in val.split(',')]
                     CONFIG['IGNORE_KEYWORDS'] = keywords
-        except:
-             print("Warning: Settings sheet not found or empty.")
+        except Exception as e:
+             print(f"Warning: Settings sheet error: {e}")
 
         # 3. Load Distances (New)
         try:
@@ -274,8 +315,8 @@ def create_distance_matrix(source):
             d = float(d_val)
         except: d = 0.0
         
-        p1 = str(row[col_p1]).strip()
-        p2 = str(row[col_p2]).strip()
+        p1 = normalize_str(row[col_p1])
+        p2 = normalize_str(row[col_p2])
         
         dist_map[(p1, p2)] = d
         dist_map[(p2, p1)] = d
@@ -297,10 +338,22 @@ def calculate_daily_km(daily_projects, dist_map):
         
         if mapped_loc: valid_projects.append(mapped_loc)
             
-    if not valid_projects: return 0.0
+    if not valid_projects: 
+        CALC_LOG.append(f"  [Date: ???] No valid active projects found. Projects: {daily_projects} -> Filtered: {valid_projects}")
+        return 0.0, ""
     
     # מסלול: בית -> פרויקט 1 -> פרויקט 2 -> ... -> בית
     route = [home] + valid_projects + [home]
+    
+    # Remove consecutive duplicates
+    deduplicated_route = []
+    for loc in route:
+        if not deduplicated_route or deduplicated_route[-1] != loc:
+            deduplicated_route.append(loc)
+    
+    route_str = ' -> '.join(deduplicated_route)
+    
+    CALC_LOG.append(f"  Route: {route_str}")
     
     total_km = 0.0
     for i in range(len(route) - 1):
@@ -318,12 +371,15 @@ def calculate_daily_km(daily_projects, dist_map):
             try:
                 # Log explicitly for the user - using repr to avoid encoding errors
                 print(f"Warning: Missing distance definition between: {repr(origin)} <--> {repr(dest)}. Using 0.0km.")
+                MISSING_PAIRS.add((origin, dest))
             except Exception as e:
                 print(f"Warning: Missing distance between points (CRITICAL display error: {e}). Using 0.0km.")
             dist = 0.0
+        
+        CALC_LOG.append(f"    Segment: {origin} -> {dest} = {dist} km")
         total_km += dist
         
-    return total_km
+    return total_km, route_str
 
 def parse_duration(x):
     if pd.isna(x) or str(x).strip() == '': return timedelta(0)
@@ -369,6 +425,9 @@ def main():
         except Exception as e: print(f"Error reading {ts}: {e}")
 
     if not all_data: return
+    
+    # CLEAR MISSING PAIRS for new run
+    MISSING_PAIRS.clear()
     
     full_df = pd.concat(all_data, ignore_index=True)
     
@@ -467,7 +526,23 @@ def main():
     print(f"Projects in File: {full_df['פרויקט'].unique()}")
     print(f"Active List from Config: {active_list}")
 
+    # CRITICAL: Save copy BEFORE filtering to active projects
+    # This preserves ALL projects for accurate entry/exit time calculation
+    unfiltered_for_times = full_df.copy()
+
     if active_list:
+        # --- DEBUG: Log Inactive Projects ---
+        # Find projects that are in the data but NOT in the active list
+        dropped_df = full_df[~full_df['פרויקט'].isin(active_list)]
+        if not dropped_df.empty:
+            dropped_projs = dropped_df['פרויקט'].unique()
+            print("\n" + "="*50)
+            print(" [שימו לב] הפרויקטים הבאים נמצאו בקובץ השעות אך לא מוגדרים כ'פעילים' (Active) בקובץ ההגדרות:")
+            for p in dropped_projs:
+                print(f"   - {p}")
+            print("   (לכן, השורות של פרויקטים אלו לא ייכללו בדו״ח הסופי)")
+            print("="*50 + "\n")
+
         # Filter: Keep if Project is in Active List
         full_df = full_df[full_df['פרויקט'].isin(active_list)]
     else:
@@ -515,6 +590,13 @@ def main():
     # המרת שעת התחלה וסיום לפורמט זמן
     full_df['שעת התחלה'] = full_df['שעת התחלה'].apply(parse_time_str)
     full_df['שעת סיום'] = full_df['שעת סיום'].apply(parse_time_str)
+    
+    # Apply same conversions to unfiltered data (for accurate entry/exit calculation)
+    unfiltered_for_times['תאריך'] = pd.to_datetime(unfiltered_for_times['תאריך'], dayfirst=True, errors='coerce')
+    unfiltered_for_times = unfiltered_for_times.dropna(subset=['תאריך'])
+    unfiltered_for_times['שעת התחלה'] = unfiltered_for_times['שעת התחלה'].apply(parse_time_str)
+    unfiltered_for_times['שעת סיום'] = unfiltered_for_times['שעת סיום'].apply(parse_time_str)
+    unfiltered_for_times = unfiltered_for_times.dropna(subset=['שעת התחלה', 'שעת סיום'])
 
     # הדפסת ערכים לבדיקה
     # print("Start Time Example:", full_df['שעת התחלה'].head())
@@ -566,49 +648,112 @@ def main():
     print(f"Active Projects Found: {len(full_df['פרויקט'].unique())}")
 
     # --- SPLIT BY MONTH ---
-    # Create a Year-Month column for grouping
+    # Create a Year-Month column for grouping (for both filtered and unfiltered)
     full_df['Month'] = full_df['תאריך'].dt.to_period('M')
+    unfiltered_for_times['Month'] = unfiltered_for_times['תאריך'].dt.to_period('M')
     
-    monthly_groups = full_df.groupby('Month')
+    # CHANGE: Group by UNFILTERED data to ensure all months with data are processed
+    monthly_groups = unfiltered_for_times.groupby('Month')
     
     print(f"Found data for {len(monthly_groups)} months. Generating reports...")
 
-    for period, month_df in monthly_groups:
+    for period, unfiltered_month in monthly_groups:
         period_str = str(period)
         print(f"\n--- Processing Month: {period_str} ---")
         
+        # Get the Filtered data for this month (for Project Breakdown)
+        month_df = full_df[full_df['Month'] == period]
+        
         # --- REPORT GENERATION (Per Month) ---
         
-        # 1. Project Summary Data
-        pivot_proj = month_df.pivot_table(
-            index='תאריך', 
-            columns='פרויקט', 
-            values='Duration', 
-            aggfunc='sum'
-        ).fillna(timedelta(0))
-        pivot_proj.loc['Grand Total'] = pivot_proj.sum()
+        # 1. Project Summary Data (From Filtered Data Only)
+        if not month_df.empty:
+            pivot_proj = month_df.pivot_table(
+                index='תאריך', 
+                columns='פרויקט', 
+                values='Duration', 
+                aggfunc='sum'
+            ).fillna(timedelta(0))
+            pivot_proj.loc['Grand Total'] = pivot_proj.sum()
+        else:
+            pivot_proj = pd.DataFrame() # No active projects this month
 
         # 2. Daily Stats Calculation
+        # CRITICAL: Use unfiltered data for entry/exit times (actual work hours)
+        # Use filtered data only for project breakdown
         daily_stats = []
-        grouped = month_df.groupby(month_df['תאריך'].dt.date)
+        travel_summary = []  # NEW: Travel summary data
         
-        for date_obj, group in grouped:
-            entry = group['שעת התחלה'].min()
-            exit_time = group['שעת סיום'].max()
+        CALC_LOG.append(f"\n--- Month: {period_str} ---")
+        
+        # Identify all unique dates in the UNFILTERED data
+        unique_dates = sorted(unfiltered_month['תאריך'].dt.date.unique())
+        
+        for date_obj in unique_dates:
+            # Get ALL projects for this date (unfiltered) for entry/exit calculation
+            unfiltered_day = unfiltered_month[unfiltered_month['תאריך'].dt.date == date_obj]
+            
+            # Get Filtered projects for this date (Active only)
+            group = month_df[month_df['תאריך'].dt.date == date_obj] if not month_df.empty else pd.DataFrame()
+            
+            if not unfiltered_day.empty:
+                # Use unfiltered data for actual work hours
+                entry = unfiltered_day['שעת התחלה'].min()
+                exit_time = unfiltered_day['שעת סיום'].max()
+                
+                # Calculate breaks from unfiltered data
+                unfiltered_day['הפסקות_delta'] = unfiltered_day['הפסקות'].apply(parse_duration)
+                total_breaks = unfiltered_day['הפסקות_delta'].sum()
+            else:
+                # Should not happen as we iterate unique_dates from unfiltered_month
+                entry = None; exit_time = None; total_breaks = timedelta(0)
 
             # המרת השעות ל-datetime מלא (אותו יום)
-            # base_date = datetime.combine(date_obj, datetime.min.time()) # Unused
-            entry_dt = datetime.combine(date_obj, entry)
-            exit_dt = datetime.combine(date_obj, exit_time)
+            if entry and exit_time:
+                entry_dt = datetime.combine(date_obj, entry)
+                exit_dt = datetime.combine(date_obj, exit_time)
+                gross_presence = exit_dt - entry_dt
+                net_time = gross_presence - total_breaks
+            else:
+                net_time = timedelta(0)
 
-            total_breaks = group['הפסקות_delta'].sum()
-            gross_presence = exit_dt - entry_dt
-            net_time = gross_presence - total_breaks
+            # חישוב קילומטרים (לפי סדר כרונולוגי של התחלה) - מעכשיו לפי הנתונים הלא-מסוננים (כולל לא פעילים)
+            # KM Calculation: Use UNFILTERED list to map the full realistic route (e.g. Home -> Inactive -> Active -> Home)
+            km = 0.0
+            if not unfiltered_day.empty:
+                # Filter out 'No Travel' tags BEFORE sorting/calculating
+                # Normalize tags just in case
+                if 'תגיות' in unfiltered_day.columns:
+                     # Remove rows where Tag contains 'ללא נסיעה'
+                     # We use a copy to avoid SettingWithCopy warning on the original slice if used elsewhere (though unfiltered_day is local)
+                     travel_rows = unfiltered_day[~unfiltered_day['תגיות'].astype(str).str.contains('ללא נסיעה', na=False, regex=False)]
+                     
+                     skipped_count = len(unfiltered_day) - len(travel_rows)
+                     if skipped_count > 0:
+                         CALC_LOG.append(f"[Date: {date_obj}] Skipped {skipped_count} locations marked as 'No Travel'.")
+                else:
+                     travel_rows = unfiltered_day
 
-            # חישוב קילומטרים (לפי סדר כרונולוגי של התחלה)
-            sorted_group = group.sort_values('שעת התחלה')
-            projects_sequence = sorted_group['פרויקט'].tolist()
-            km = calculate_daily_km(projects_sequence, dist_map)
+                if not travel_rows.empty:
+                    sorted_daily = travel_rows.sort_values('שעת התחלה')
+                    projects_sequence = sorted_daily['פרויקט'].tolist()
+                    
+                    CALC_LOG.append(f"[Date: {date_obj}] Calculating KM (Using {len(projects_sequence)} points)...")
+                    km, route_str = calculate_daily_km(projects_sequence, dist_map)
+                    CALC_LOG.append(f"  Total KM: {km}\n")
+                    
+                    # Add to travel summary
+                    travel_summary.append({
+                        'תאריך': date_obj,
+                        'מסלול': route_str,
+                        'ק"מ': km
+                    })
+                else:
+                    CALC_LOG.append(f"[Date: {date_obj}] All points skipped due to 'No Travel' tag.")
+                    route_str = ""
+            else:
+                 # Should theoretically not pass here if iterating unique_dates
+                 CALC_LOG.append(f"[Date: {date_obj}] No data found (Empty unfiltered_day).")
 
             row_data = {
                 'תאריך': date_obj,
@@ -619,10 +764,11 @@ def main():
                 KM_COL_NAME: km
             }
 
-            # הוספת פירוט לכל פרויקט
-            proj_sums = group.groupby('פרויקט')['Duration'].sum()
-            for proj, duration in proj_sums.items():
-                row_data[proj] = duration
+            # הוספת פירוט לכל פרויקט (ACTIVE projects only)
+            if not group.empty:
+                proj_sums = group.groupby('פרויקט')['Duration'].sum()
+                for proj, duration in proj_sums.items():
+                    row_data[proj] = duration
 
             daily_stats.append(row_data)
             
@@ -744,6 +890,53 @@ def main():
             else:
                 # Missing column (shouldn't happen for core ones, but maybe optional cols)
                 pass
+        
+
+        # --- SAVE CALCULATION LOG ---
+        try:
+            log_path = os.path.join(base_dir, "Calculation_Log.txt")
+            with open(log_path, 'w', encoding='utf-8') as f:
+                f.write("\n".join(str(x) for x in CALC_LOG))
+            print(f"[DEBUG] Calculation Log saved to: {log_path}")
+        except Exception as e:
+            print(f"[WARN] Failed to save calculation log: {e}")
+
+    # --- REPORT MISSING PAIRS ---
+        if MISSING_PAIRS:
+            print("\n" + "!"*50)
+            print("WARNING: Some distances were missing and calculated as 0 km.")
+            print(f"Found {len(MISSING_PAIRS)} missing pairs.")
+            
+            # Save to file
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            missing_file = os.path.join(base_dir, "Missing_Distances.txt")
+            
+            try:
+                with open(missing_file, 'w', encoding='utf-8') as f:
+                    f.write("The following location pairs have no distance defined in Config.xlsx:\n")
+                    f.write("(Please add them to the 'Distances' sheet)\n\n")
+                    for p1, p2 in sorted(list(MISSING_PAIRS)):
+                        f.write(f"{p1} <--> {p2}\n")
+                
+                print(f"A list of missing pairs has been saved to:\n{missing_file}")
+                
+                # Popup if GUI available
+                try:
+                    import tkinter.messagebox as messagebox
+                    root = tk.Tk()
+                    root.withdraw()
+                    root.attributes('-topmost', True)
+                    messagebox.showwarning(
+                        "חסרים מרחקים", 
+                        f"שימו לב:\nנמצאו {len(MISSING_PAIRS)} זוגות מיקומים ללא הגדרת מרחק.\n\nרשימה מלאה נשמרה בקובץ:\nMissing_Distances.txt"
+                    )
+                    root.destroy()
+                except: pass
+                
+            except Exception as e:
+                 print(f"Error writing missing pairs file: {e}")
+                 
+            print("!"*50 + "\n")
 
         # Ensure 'Total' and 'KM' are present (created above)
         
@@ -766,7 +959,9 @@ def main():
         # but Excel formulas returning 0 show 0. We'll use custom number format to hide it: #,##0.00;-#,##0.00;;
         
         try:
+            print(f"[DEBUG] Initializing ExcelWriter for {output_filename}...")
             with pd.ExcelWriter(output_filename, engine='xlsxwriter') as writer:
+                print("[DEBUG] ExcelWriter initialized. Writing sheets...")
                 workbook = writer.book
                 
                 # Formats
@@ -779,9 +974,9 @@ def main():
                 # --- SHEET 1: PROJECT SUMMARY ---
                 # Clean Zeros for Display
                 pivot_display = pivot_proj_export.applymap(lambda x: fmt_zero(x) if x == 0 else x)
-                pivot_display.to_excel(writer, sheet_name='Project Summary')
+                pivot_display.to_excel(writer, sheet_name='סיכום לפי לקוח')
                 
-                ws_summ = writer.sheets['Project Summary']
+                ws_summ = writer.sheets['סיכום לפי לקוח']
                 ws_summ.right_to_left() # RTL
                 ws_summ.set_column('A:A', 12, date_fmt)
                 ws_summ.set_column('B:Z', 12, decimal_fmt)
@@ -811,9 +1006,9 @@ def main():
                           display_df[c] = display_df[c].apply(lambda x: fmt_zero(x) if x == 0 else x)
 
                 # Write
-                display_df.to_excel(writer, sheet_name='Detailed Report', index=False)
+                display_df.to_excel(writer, sheet_name='סיכום מפורט', index=False)
                 
-                ws_detail = writer.sheets['Detailed Report']
+                ws_detail = writer.sheets['סיכום מפורט']
                 ws_detail.right_to_left() # RTL
                 ws_detail.set_column('A:A', 20, date_fmt) 
                 ws_detail.set_column('B:C', 10, time_fmt)
@@ -895,8 +1090,8 @@ def main():
                 exec_export[KM_COL_NAME] = exec_export[KM_COL_NAME].apply(lambda x: fmt_zero(x) if x == 0 else x)
                 # Breaks is Decimal Hours now, don't format as time
                 
-                exec_export.to_excel(writer, sheet_name='Executive Summary', index=False)
-                ws_exec = writer.sheets['Executive Summary']
+                exec_export.to_excel(writer, sheet_name='סיכום עובד מקוצר', index=False)
+                ws_exec = writer.sheets['סיכום עובד מקוצר']
                 ws_exec.right_to_left() # RTL
                 ws_exec.set_column('A:A', 20, date_fmt)
                 ws_exec.set_column('B:C', 10, time_fmt)
@@ -926,6 +1121,16 @@ def main():
                     # (Out-In)*24 - Breaks
                     formula = f"=(C{xl_row+1}-B{xl_row+1})*24-D{xl_row+1}"
                     ws_exec.write_formula(xl_row, 4, formula, decimal_fmt)
+
+                # --- SHEET 4: TRAVEL SUMMARY ---
+                travel_df = pd.DataFrame(travel_summary)
+                if not travel_df.empty:
+                    travel_df.to_excel(writer, sheet_name='סיכום נסיעות', index=False)
+                    ws_travel = writer.sheets['סיכום נסיעות']
+                    ws_travel.right_to_left()
+                    ws_travel.set_column('A:A', 12, date_fmt)  # Date
+                    ws_travel.set_column('B:B', 60)  # Route (wide)
+                    ws_travel.set_column('C:C', 10, num_fmt)  # KM
 
                 # --- SHEET 4+: PER PROJECT SHEETS ---
                 monthly_projects = month_df['פרויקט'].unique()
@@ -1004,9 +1209,14 @@ def main():
     
             print(f"SUCCESS: Report saved successfully to:\n{os.path.abspath(output_filename)}")
     
+            print(f"SUCCESS: Report saved successfully to:\n{os.path.abspath(output_filename)}")
+    
         except Exception as e:
             print(f"ERROR Saving Excel: {e}")
             print("Tip: Close the Excel file if it's currently open!")
+            import traceback
+            traceback.print_exc()
+
 
 if __name__ == "__main__":
     try:
