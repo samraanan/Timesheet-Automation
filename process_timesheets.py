@@ -697,7 +697,10 @@ def main():
         
         # Identify all unique dates in the UNFILTERED data
         unique_dates = sorted(unfiltered_month['תאריך'].dt.date.unique())
-        
+
+        # Track outside-work-hours gross contribution per date (used later for Excel formula)
+        outside_hours_map = {}
+
         for date_obj in unique_dates:
             # Get ALL projects for this date (unfiltered) for entry/exit calculation
             unfiltered_day = unfiltered_month[unfiltered_month['תאריך'].dt.date == date_obj]
@@ -706,27 +709,55 @@ def main():
             group = month_df[month_df['תאריך'].dt.date == date_obj] if not month_df.empty else pd.DataFrame()
             
             if not unfiltered_day.empty:
-                # Use unfiltered data for actual work hours
-                entry = unfiltered_day['שעת התחלה'].min()
-                exit_time = unfiltered_day['שעת סיום'].max()
-                
-                # Calculate breaks from unfiltered data
-                if 'הפסקות' not in unfiltered_day.columns:
-                    unfiltered_day['הפסקות'] = None
-                unfiltered_day['הפסקות_delta'] = unfiltered_day['הפסקות'].apply(parse_duration)
-                total_breaks = unfiltered_day['הפסקות_delta'].sum()
+                # Split: regular rows vs. "outside work hours" rows
+                if 'תגיות' in unfiltered_day.columns:
+                    outside_mask = unfiltered_day['תגיות'].astype(str).str.contains('מחוץ לשעות העבודה', na=False, regex=False)
+                else:
+                    outside_mask = pd.Series([False] * len(unfiltered_day), index=unfiltered_day.index)
+
+                regular_rows = unfiltered_day[~outside_mask]
+                outside_rows = unfiltered_day[outside_mask]
+
+                # Entry/exit times from regular rows only; outside-hours rows don't affect displayed times
+                rows_for_times = regular_rows if not regular_rows.empty else unfiltered_day
+                entry = rows_for_times['שעת התחלה'].min()
+                exit_time = rows_for_times['שעת סיום'].max()
+
+                # Calculate breaks from ALL rows
+                _ud = unfiltered_day.copy()
+                if 'הפסקות' not in _ud.columns:
+                    _ud['הפסקות'] = None
+                _ud['הפסקות_delta'] = _ud['הפסקות'].apply(parse_duration)
+                total_breaks = _ud['הפסקות_delta'].sum()
             else:
                 # Should not happen as we iterate unique_dates from unfiltered_month
                 entry = None; exit_time = None; total_breaks = timedelta(0)
+                regular_rows = pd.DataFrame()
+                outside_rows = pd.DataFrame()
 
             # המרת השעות ל-datetime מלא (אותו יום)
             if entry and exit_time:
                 entry_dt = datetime.combine(date_obj, entry)
                 exit_dt = datetime.combine(date_obj, exit_time)
+                # gross_presence is from regular rows only; outside-hours duration added separately below
                 gross_presence = exit_dt - entry_dt
                 net_time = gross_presence - total_breaks
             else:
                 net_time = timedelta(0)
+
+            # Add net duration of "outside work hours" rows to employee & client totals.
+            # These count toward total hours but do NOT define the work-day exit time.
+            outside_gross_hours = 0.0
+            if not outside_rows.empty:
+                for _, orow in outside_rows.iterrows():
+                    start = orow.get('שעת התחלה')
+                    end = orow.get('שעת סיום')
+                    if pd.notna(start) and pd.notna(end):
+                        outside_dur = datetime.combine(date_obj, end) - datetime.combine(date_obj, start)
+                        # Breaks for outside rows already subtracted via total_breaks above
+                        net_time += outside_dur
+                        outside_gross_hours += outside_dur.total_seconds() / 3600
+            outside_hours_map[date_obj] = outside_gross_hours
 
             # חישוב קילומטרים (לפי סדר כרונולוגי של התחלה) - מעכשיו לפי הנתונים הלא-מסוננים (כולל לא פעילים)
             # KM Calculation: Use UNFILTERED list to map the full realistic route (e.g. Home -> Inactive -> Active -> Home)
@@ -1084,11 +1115,17 @@ def main():
                             continue
 
                         # Normal Row Formula
-                        # (Exit-Entry)*24 - Breaks
+                        # (Exit-Entry)*24 - Breaks [+ outside-work-hours gross if any]
                         let_entry = chr(ord('A') + col_entry)
                         let_exit = chr(ord('A') + col_exit)
                         let_break = chr(ord('A') + col_breaks)
-                        formula = f"=(({let_exit}{xl_row+1}-{let_entry}{xl_row+1})*24)-{let_break}{xl_row+1}"
+                        row_date = display_df.iloc[r]['תאריך']
+                        outside_extra = outside_hours_map.get(row_date, 0.0)
+                        base_formula = f"(({let_exit}{xl_row+1}-{let_entry}{xl_row+1})*24)-{let_break}{xl_row+1}"
+                        if outside_extra > 0:
+                            formula = f"={base_formula}+{outside_extra:.6f}"
+                        else:
+                            formula = f"={base_formula}"
                         ws_detail.write_formula(xl_row, col_total_idx, formula, decimal_fmt)
 
                 # Formats
@@ -1147,8 +1184,14 @@ def main():
                          continue
 
                     # Normal Row Formula
-                    # (Out-In)*24 - Breaks
-                    formula = f"=(C{xl_row+1}-B{xl_row+1})*24-D{xl_row+1}"
+                    # (Out-In)*24 - Breaks [+ outside-work-hours gross if any]
+                    row_date_exec = exec_export.iloc[r]['תאריך']
+                    outside_extra_exec = outside_hours_map.get(row_date_exec, 0.0)
+                    base_exec = f"(C{xl_row+1}-B{xl_row+1})*24-D{xl_row+1}"
+                    if outside_extra_exec > 0:
+                        formula = f"={base_exec}+{outside_extra_exec:.6f}"
+                    else:
+                        formula = f"={base_exec}"
                     ws_exec.write_formula(xl_row, 4, formula, decimal_fmt)
 
                 # --- SHEET 4: TRAVEL SUMMARY ---
