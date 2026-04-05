@@ -396,7 +396,9 @@ def parse_duration(x):
 def main():
     # 1. LOAD CONFIG
     load_configuration()
-    
+    # Rename 'החדשה' -> 'הקרן החדשה' in source data (project was renamed)
+    CONFIG.setdefault('MAPPING', {})['החדשה'] = 'הקרן החדשה'
+
     # 2. LOAD FILES
     dist_file, ts_files = load_data_files()
     
@@ -430,7 +432,12 @@ def main():
     MISSING_PAIRS.clear()
     
     full_df = pd.concat(all_data, ignore_index=True)
-    
+
+    # Ensure all optional columns exist (may be missing if source file lacks them)
+    for _col in ALLOWED_COLUMNS:
+        if _col not in full_df.columns:
+            full_df[_col] = 0 if _col == "הפסקות" else None
+
     # NORMALIZE PROJECT COLUMN IMMEDIATELY
     full_df['פרויקט'] = full_df['פרויקט'].apply(normalize_str)
     
@@ -639,6 +646,8 @@ def main():
             return timedelta(0)
 
     full_df['Duration'] = full_df.apply(calc_duration, axis=1)
+    if 'הפסקות' not in full_df.columns:
+        full_df['הפסקות'] = None
     full_df['הפסקות_delta'] = full_df['הפסקות'].apply(parse_duration)
 
     # print("Duration Example:", full_df['Duration'].head())
@@ -702,6 +711,8 @@ def main():
                 exit_time = unfiltered_day['שעת סיום'].max()
                 
                 # Calculate breaks from unfiltered data
+                if 'הפסקות' not in unfiltered_day.columns:
+                    unfiltered_day['הפסקות'] = None
                 unfiltered_day['הפסקות_delta'] = unfiltered_day['הפסקות'].apply(parse_duration)
                 total_breaks = unfiltered_day['הפסקות_delta'].sum()
             else:
@@ -800,7 +811,7 @@ def main():
             return x
 
         # Create export versions with decimal hours
-        pivot_proj_export = pivot_proj.applymap(to_hours)
+        pivot_proj_export = pivot_proj.map(to_hours)
         
         # Calculate detailed report export
         detailed_df = stats_df.copy()
@@ -842,7 +853,7 @@ def main():
             if 'KM' in s.upper(): return True
             return False
 
-        proj_cols = [c for c in existing_cols if not is_prohibited(c)]
+        proj_cols = [c for c in existing_cols if not is_prohibited(c) and str(c).strip() not in ('', 'nan', 'None')]
         
         # Deduplicate final columns list just in case
         final_cols_pre = base_cols + proj_cols + end_cols
@@ -960,7 +971,9 @@ def main():
         
         try:
             print(f"[DEBUG] Initializing ExcelWriter for {output_filename}...")
-            with pd.ExcelWriter(output_filename, engine='xlsxwriter') as writer:
+            with pd.ExcelWriter(output_filename, engine='xlsxwriter',
+                                date_format='dd/mm/yyyy',
+                                datetime_format='dd/mm/yyyy') as writer:
                 print("[DEBUG] ExcelWriter initialized. Writing sheets...")
                 workbook = writer.book
                 
@@ -971,15 +984,25 @@ def main():
                 decimal_fmt = workbook.add_format({'num_format': '#,##0.00;-#,##0.00;;'})   
                 num_fmt = workbook.add_format({'num_format': '#,##0.0;-#,##0.0;;'})
                 
+                # Header format
+                header_fmt = workbook.add_format({'bold': True, 'text_wrap': True, 'align': 'center', 'valign': 'bottom'})
+
+                def rewrite_headers(ws, headers, fmt):
+                    for col_idx, h in enumerate(headers):
+                        ws.write(0, col_idx, h, fmt)
+
                 # --- SHEET 1: PROJECT SUMMARY ---
                 # Clean Zeros for Display
-                pivot_display = pivot_proj_export.applymap(lambda x: fmt_zero(x) if x == 0 else x)
+                pivot_display = pivot_proj_export.map(lambda x: fmt_zero(x) if x == 0 else x)
                 pivot_display.to_excel(writer, sheet_name='סיכום לפי לקוח')
                 
                 ws_summ = writer.sheets['סיכום לפי לקוח']
                 ws_summ.right_to_left() # RTL
                 ws_summ.set_column('A:A', 12, date_fmt)
                 ws_summ.set_column('B:Z', 12, decimal_fmt)
+                # Re-write headers
+                summ_headers = ['תאריך'] + pivot_display.columns.tolist()
+                rewrite_headers(ws_summ, summ_headers, header_fmt)
 
                 # --- SHEET 2: DETAILED REPORT ---
                 # Write data (without formulas first)
@@ -989,13 +1012,14 @@ def main():
                 # --- REMOVE REDUNDANT 'GRAND TOTAL' ---
                 # Fixed logic below using display_df
                 
-                # Let's fix the dataframe BEFORE writing
+                # Fix Total row date label in both dataframes
                 if 'Total' in detailed_df.index:
                      detailed_df.at['Total', 'תאריך'] = 'Total'
-                
-                # Revert to using detailed_df for writing logic to ensure we control the 'Total' row
-                # We need to re-apply the fmt_zero to a display copy
-                display_df = detailed_df.copy()
+                if 'Total' in detailed_export.index:
+                     detailed_export.at['Total', 'תאריך'] = 'Total'
+
+                # Use detailed_export (correct column order: base + projects + totals)
+                display_df = detailed_export.copy()
                 try:
                     display_df.drop(index='Grand Total', inplace=True, errors='ignore')
                 except: pass
@@ -1015,6 +1039,8 @@ def main():
                 
                 # Dynamic Column Indices
                 headers = display_df.columns.tolist()
+                # Re-write headers
+                rewrite_headers(ws_detail, headers, header_fmt)
                 
                 # Find Notes column index for Text Wrap
                 try:
@@ -1043,14 +1069,17 @@ def main():
                         val_date = str(display_df.iloc[r]['תאריך'])
                         
                         if val_date == 'Total':
-                            # Write SUM formula (Bottom Row)
-                            # =SUM(E2:E{last_data})
-                            # This answers "Formula in summary row should be different"
-                            col_letter = chr(ord('A') + col_total_idx)
-                            last_data_row = xl_row # Row BEFORE this one (Excel row is 1-based, previous is row_idx)
-                            formula = f"=SUM({col_letter}2:{col_letter}{last_data_row})"
-                            ws_detail.write_formula(xl_row, col_total_idx, formula, workbook.add_format({'bold': True, 'num_format': '0.00'}))
-                            # Also write label bold
+                            bold_dec = workbook.add_format({'bold': True, 'num_format': '0.00'})
+                            bold_num = workbook.add_format({'bold': True, 'num_format': '#,##0.0'})
+                            last_data_row = xl_row
+                            # SUM formulas for ALL numeric columns
+                            for ci, cn in enumerate(headers):
+                                if cn in proj_cols + ['הפסקות', TOTAL_COL_NAME]:
+                                    cl = chr(ord('A') + ci)
+                                    ws_detail.write_formula(xl_row, ci, f"=SUM({cl}2:{cl}{last_data_row})", bold_dec)
+                                elif cn == KM_COL_NAME:
+                                    cl = chr(ord('A') + ci)
+                                    ws_detail.write_formula(xl_row, ci, f"=SUM({cl}2:{cl}{last_data_row})", bold_num)
                             ws_detail.write(xl_row, 0, 'Total', workbook.add_format({'bold': True}))
                             continue
 
@@ -1098,6 +1127,7 @@ def main():
                 ws_exec.set_column('D:D', 10, decimal_fmt) # Breaks -> DECIMAL
                 ws_exec.set_column('E:E', 12, decimal_fmt) # Total -> DECIMAL
                 ws_exec.set_column('F:F', 10, num_fmt)     # KM
+                rewrite_headers(ws_exec, exec_export.columns.tolist(), header_fmt)
 
                 # Add Formulas to Executive Summary
                 # Loop all rows including Total
@@ -1106,14 +1136,13 @@ def main():
                     
                     # Check if Total Row
                     if str(exec_export.iloc[r]['תאריך']) == 'Total':
-                         # SUM Formula for Total Column (E)
-                         # =SUM(E2:E{last_data})
-                         col_idx = 4 # E
-                         col_let = 'E'
-                         last_data = xl_row 
-                         formula = f"=SUM({col_let}2:{col_let}{last_data})"
-                         ws_exec.write_formula(xl_row, col_idx, formula, workbook.add_format({'bold': True, 'num_format': '0.00'}))
-                         # Bold Label
+                         bold_dec = workbook.add_format({'bold': True, 'num_format': '0.00'})
+                         bold_num = workbook.add_format({'bold': True, 'num_format': '#,##0.0'})
+                         last_data = xl_row
+                         # SUM formulas for D(breaks), E(total), F(km)
+                         ws_exec.write_formula(xl_row, 3, f"=SUM(D2:D{last_data})", bold_dec)
+                         ws_exec.write_formula(xl_row, 4, f"=SUM(E2:E{last_data})", bold_dec)
+                         ws_exec.write_formula(xl_row, 5, f"=SUM(F2:F{last_data})", bold_num)
                          ws_exec.write(xl_row, 0, 'Total', workbook.add_format({'bold': True}))
                          continue
 
@@ -1131,6 +1160,7 @@ def main():
                     ws_travel.set_column('A:A', 12, date_fmt)  # Date
                     ws_travel.set_column('B:B', 60)  # Route (wide)
                     ws_travel.set_column('C:C', 10, num_fmt)  # KM
+                    rewrite_headers(ws_travel, travel_df.columns.tolist(), header_fmt)
 
                 # --- SHEET 4+: PER PROJECT SHEETS ---
                 monthly_projects = month_df['פרויקט'].unique()
@@ -1178,6 +1208,7 @@ def main():
                     ws_proj.set_column('B:C', 10, time_fmt)
                     ws_proj.set_column('D:D', 40)
                     ws_proj.set_column('E:E', 12, decimal_fmt)
+                    rewrite_headers(ws_proj, proj_sheet_df.columns.tolist(), header_fmt)
                     
                     # --- ADD FORMULAS & GRAND TOTAL ---
                     # Columns: A(Date), B(Entry), C(Exit), D(Notes), E(Total)
